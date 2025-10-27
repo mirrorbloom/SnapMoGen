@@ -28,7 +28,7 @@ class EvaluatorWrapper:
         device,
         model_name='net_best_top1'
     ):
-        # yaml_path = pjoin('./checkpoint_dir/snapmotion/evaluator', 
+        # yaml_path = pjoin('./checkpoint_dir/snapmogen/evaluator', 
         #                   evaluator_name, 
         #                   'evaluator.yaml')
         # cfg = load_config(cfg_path)
@@ -116,7 +116,7 @@ class EvaluatorWrapperV2:
         device,
         model_name='net_best_top1'
     ):
-        # yaml_path = pjoin('./checkpoint_dir/snapmotion/evaluator', 
+        # yaml_path = pjoin('./checkpoint_dir/snapmogen/evaluator', 
         #                   evaluator_name, 
         #                   'evaluator.yaml')
         # cfg = load_config(cfg_path)
