@@ -163,6 +163,7 @@ if __name__ == '__main__':
     animate_gt = False
 
     texts = [
+        "attack hard",
         "A person is practicing martial arts in slow motion.",
         "A person is walking like they’re stuck in molasses.",
         "A person is pretending to be a bird taking flight.",
@@ -214,6 +215,7 @@ if __name__ == '__main__':
     ]
     
     rewrite_texts = [
+        "The person steps forward aggressively with a wide stance, raising both arms in a defensive posture. They then swing their right arm forcefully in a punching motion, followed by a quick left hook. The torso twists sharply with each strike. The person finishes with a strong forward lunge, simulating a powerful attack with full body engagement.",
         "The person stands tall, then flows through a sequence of slow, deliberate martial arts moves. Each punch, kick, and block is executed with precise control and fluidity. Their torso twists gracefully, limbs extend smoothly, and breathing is deep and measured. The pace is unhurried but powerful, emphasizing tension and control throughout the motions.",
         "The person moves forward with exaggerated heaviness, each step slow and effortful as if trudging through thick molasses. Their feet drag slightly on the ground, knees lift slowly, and the torso leans forward with weight. Arms swing sluggishly by their sides, and their face shows strain as they push through the sticky, resistant environment.",
         "The person crouches low with knees bent and arms extended sideways like wings. They begin with small hops, gradually increasing height and breadth of their arm flaps. Their torso leans forward as they simulate taking off, rising onto the balls of their feet and stretching limbs outward. Movements are fluid and soaring, embodying the effort and grace of flight.",

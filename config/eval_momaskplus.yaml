@@ -1,4 +1,4 @@
-root_ckpt_dir: './checkpoint_dir'
+root_ckpt_dir: '/home/zhouyingchengliao/project/SnapMoGen/checkpoint_dir'
 device: 'cuda:0'
 
 seed: 100039
@@ -26,7 +26,7 @@ repeat_time: 20
 data:
   name: 'snapmogen'
   unit_length: 8
-  root_dir: '/mnt/local-disk/SnapMoGen'
+  root_dir: '/home/zhouyingchengliao/project/SnapMoGen'
   joint_num: 24
   dim_pose: 296 #here we use all features
   fps: 30
