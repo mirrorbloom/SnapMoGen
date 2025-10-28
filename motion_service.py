@@ -5,9 +5,21 @@ import os
 import uuid
 import asyncio
 from datetime import datetime, timedelta
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, Callable, Awaitable, Deque, List
 from os.path import join as pjoin
+from collections import deque
 import re
+import tempfile
+import shutil
+import threading
+
+# Async HTTP and file helpers used by submit/check/download utilities
+import aiohttp
+import aiofiles
+from pathlib import Path
+
+# Simple logging helper for the module (used as Log in helper functions)
+import logging
 
 import torch
 import numpy as np
@@ -18,6 +30,62 @@ from minio.error import S3Error
 import io
 from contextlib import asynccontextmanager
 from openai import OpenAI
+
+# Module logger used by existing helper code; replace/configure as needed.
+Log = logging.getLogger("motion_service")
+if not Log.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    handler.setFormatter(formatter)
+    Log.addHandler(handler)
+Log.setLevel(logging.INFO)
+
+def load_env_file(env_path: str) -> None:
+    """Load environment variables from a .env-style file without overriding existing values."""
+    candidate = Path(env_path)
+    if not candidate.is_file():
+        candidate = Path(__file__).resolve().parent / env_path
+    if not candidate.is_file():
+        return
+
+    try:
+        with candidate.open("r", encoding="utf-8") as env_file:
+            for raw_line in env_file:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = value
+        Log.info(f"Loaded environment variables from {candidate}")
+    except Exception as exc:
+        Log.warning(f"Failed to load environment file {candidate}: {exc}")
+
+
+load_env_file(os.getenv("ENV_FILE_PATH", ".env.dev"))
+
+# Optional external service API key used in submit_task helper; default to empty string if not set.
+BLENDER_SERVICE_API_KEY = os.getenv("BLENDER_SERVICE_API_KEY", "")
+
+# External Blender/retarget service endpoints
+BLENDER_BASE_URL = os.getenv("BLENDER_BASE_URL", "http://localhost:8001")
+RETARGET_SERVICE_URL = os.getenv("RETARGET_SERVICE_URL", f"{BLENDER_BASE_URL.rstrip('/')}/retarget")
+RETARGET_STATUS_URL = os.getenv("RETARGET_STATUS_URL", f"{BLENDER_BASE_URL.rstrip('/')}/retarget_status")
+RENDER_SERVICE_URL = os.getenv("RENDER_SERVICE_URL", f"{BLENDER_BASE_URL.rstrip('/')}/render_animation")
+RENDER_STATUS_URL = os.getenv("RENDER_STATUS_URL", f"{BLENDER_BASE_URL.rstrip('/')}/render_status")
+RETARGET_POLL_INTERVAL = float(os.getenv("RETARGET_POLL_INTERVAL", "2.0"))
+RETARGET_PRESET_NAME = os.getenv("RETARGET_PRESET_NAME", "")
+RETARGET_TARGET_FILE = os.getenv("RETARGET_TARGET_FILE", "")
+RETARGET_SOURCE_REST_FILE = os.getenv("RETARGET_SOURCE_REST_FILE", "")
+RETARGET_TARGET_REST_FILE = os.getenv("RETARGET_TARGET_REST_FILE", "")
+
+# Asset paths
+ASSET_PATH = os.getenv("ASSET_PATH", "./assets")
+MOMAX_BOT_PATH = os.getenv("MOMAX_BOT_PATH", f"{ASSET_PATH}/MomaxBot.fbx")
 
 from model.vq.rvq_model import HRVQVAE
 from model.transformer.transformer import MoMaskPlus
@@ -44,6 +112,18 @@ retargeter = None
 
 # Task status tracking
 task_status: Dict[str, Dict[str, Any]] = {}
+task_lock = threading.Lock()
+
+# Task queue infrastructure
+task_queue_dict: Dict[str, asyncio.Queue] = {}
+pending_queue_map: Dict[str, Deque[str]] = {}
+queue_workers: Dict[str, List[asyncio.Task]] = {}
+
+# Queue configuration
+QUEUE_DEFAULT_WORKERS = int(os.getenv("MOTION_QUEUE_DEFAULT_WORKERS", "1"))
+NUM_WORKERS = int(os.getenv("MOTION_NUM_WORKERS", "1"))
+POLL_INTERVAL_SEC = float(os.getenv("MOTION_POLL_INTERVAL_SEC", "5"))
+TASK_STALE_MIN = float(os.getenv("MOTION_TASK_STALE_MIN", "60"))
 
 # Task cleanup configuration
 MAX_TASK_RETENTION_HOURS = 24  # Keep completed tasks for 24 hours
@@ -129,11 +209,464 @@ class TaskStatusResponse(BaseModel):
     created_at: str
     completed_at: Optional[str] = None
     download_url: Optional[str] = None
+    result_urls: Optional[Dict[str, str]] = None
+    error_message: Optional[str] = None
+    # Queue metadata
+    queue_position: Optional[int] = None
+    queue_size: Optional[int] = None
+    queue_name: Optional[str] = None
+    queued_at: Optional[str] = None
+    last_progress_at: Optional[str] = None
 
 class UploadResponse(BaseModel):
     task_id: str
     status: str
     message: str
+
+async def submit_task(url: str, **kwargs) -> Dict:
+    try:
+        data = aiohttp.FormData()
+        params = {}
+        for key, value in kwargs.items():
+            if value is None:
+                continue
+            file_path = Path(value) if isinstance(value, (str, Path)) else None
+            if file_path and file_path.is_file():
+                Log.info(f"上传文件 {key}: {file_path}")
+                async with aiofiles.open(file_path, "rb") as f:
+                    file_bytes = await f.read()
+                data.add_field(
+                    name=key,
+                    value=file_bytes,
+                    filename=file_path.name,
+                    content_type="application/octet-stream",
+                )
+            else:
+                if isinstance(value, bool):
+                    payload = "true" if value else "false"
+                else:
+                    payload = str(value)
+                Log.info(f"添加表单字段 {key}: {payload}")
+                params[key] = payload
+        url += "?" + "&".join([f"{k}={v}" for k, v in params.items()])
+        headers = {}
+        if BLENDER_SERVICE_API_KEY:
+            headers["Authorization"] = f"Bearer {BLENDER_SERVICE_API_KEY}"
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, data=data, headers=headers) as response:
+                if response.status == 200:
+                    return await response.json()
+                # 尝试读取错误详情
+                err_text = await response.text()
+                Log.error(f"提交任务失败: {response.status}, body={err_text}")
+                return {"error": str(response.status), "body": err_text}
+    except Exception as e:
+        Log.error(f"调用提交任务失败: {e}")
+        return {"error": str(e)}
+
+async def check_task_status(url: str, task_id: str) -> Dict:
+    try:
+        async with aiohttp.ClientSession() as session:
+            # # 优先使用查询参数风格：/retarget_status?task_id=...
+            # async with session.get(url, params={"task_id": task_id}) as response:
+            #     if response.status == 200:
+            #         return await response.json()
+            #     fallback_text = await response.text()
+            #     Log.warning(f"状态查询(参数)失败: {response.status}, body={fallback_text}, 尝试路径风格")
+            # 优先路径参数风格：/retarget_status/<task_id>
+            path_url = f"{url.rstrip('/')}/{task_id}"
+            async with session.get(path_url) as response:
+                if response.status == 200:
+                    return await response.json()
+                Log.error(f"检查任务状态失败: {response.status}")
+                return {"error": str(response.status), "body": await response.text()}
+
+    except Exception as e:
+        Log.error(f"调用检查任务状态失败: {e}")
+        return {"error": str(e)}
+
+async def download_file(url: str, output_path: str) -> bool:
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                if response.status == 200:
+                    with open(output_path, 'wb') as f:
+                        async for chunk in response.content.iter_chunked(8192):
+                            f.write(chunk)
+                    return True
+                else:
+                    Log.error(f"下载文件失败: {response.status}")
+                    return False
+    except Exception as e:
+        Log.error(f"调用下载文件失败: {e}")
+        return False
+
+async def retarget_to_smplx_async(source_bvh_url: str, output_fbx_path: str, preset_name: Optional[str] = None) -> bool:
+    """Send BVH to external retarget service and save FBX output locally."""
+    preset = preset_name or RETARGET_PRESET_NAME or None
+    temp_dir = tempfile.mkdtemp(prefix="retarget_")
+    temp_path = Path(temp_dir)
+    source_path = temp_path / "motion_input.bvh"
+
+    try:
+        # Download BVH generated by this service so it can be uploaded to the retarget endpoint.
+        download_ok = await download_file(source_bvh_url, str(source_path))
+        if not download_ok:
+            Log.error("Retargeting aborted: unable to fetch generated BVH from storage")
+            return False
+
+        submit_kwargs: Dict[str, Any] = {"src_file": str(source_path)}
+
+        if RETARGET_TARGET_FILE:
+            submit_kwargs["tgt_file"] = RETARGET_TARGET_FILE
+        if RETARGET_SOURCE_REST_FILE:
+            submit_kwargs["src_rest_file"] = RETARGET_SOURCE_REST_FILE
+        if RETARGET_TARGET_REST_FILE:
+            submit_kwargs["tgt_rest_file"] = RETARGET_TARGET_REST_FILE
+        if preset:
+            submit_kwargs["preset_name"] = preset
+
+        response = await submit_task(RETARGET_SERVICE_URL, **submit_kwargs)
+        task_id = response.get("task_id") if isinstance(response, dict) else None
+        if not task_id:
+            Log.error(f"Retarget service did not return task_id, response={response}")
+            return False
+
+        Log.info(f"Retarget task submitted: {task_id}")
+
+        while True:
+            status = await check_task_status(RETARGET_STATUS_URL, task_id)
+            if not isinstance(status, dict):
+                Log.error(f"Unexpected retarget status payload: {status}")
+                return False
+
+            if "error" in status:
+                Log.error(f"Retarget status query failed: {status}")
+                return False
+
+            state = status.get("status")
+            if state == "completed":
+                download_url = status.get("download_url") or status.get("result_url")
+                if not download_url:
+                    Log.error(f"Retarget task completed without download URL: {status}")
+                    return False
+
+                if download_url.startswith("http"):
+                    final_url = download_url
+                else:
+                    final_url = f"{BLENDER_BASE_URL.rstrip('/')}/{download_url.lstrip('/')}"
+
+                output_path = Path(output_fbx_path)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+
+                saved = await download_file(final_url, str(output_path))
+                if not saved:
+                    Log.error("Failed to download FBX result from retarget service")
+                    return False
+
+                Log.info(f"Retarget task {task_id} completed and saved to {output_path}")
+                return True
+
+            if state == "failed":
+                err_msg = status.get("error_message") or status.get("message")
+                Log.error(f"Retarget task {task_id} failed: {err_msg}")
+                return False
+
+            await asyncio.sleep(RETARGET_POLL_INTERVAL)
+
+    except Exception as exc:
+        Log.error(f"Retarget service error: {exc}")
+        return False
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+async def retarget_task_async(source_bvh_url: str, target_fbx_path: str, output_fbx_path: str, preset_name: Optional[str] = None) -> bool:
+    """Send BVH to external retarget service and save FBX output locally."""
+    preset = preset_name or RETARGET_PRESET_NAME or None
+    temp_dir = tempfile.mkdtemp(prefix="retarget_")
+    temp_path = Path(temp_dir)
+    source_path = temp_path / "motion_input.bvh"
+
+    try:
+        # Download BVH generated by this service so it can be uploaded to the retarget endpoint.
+        download_ok = await download_file(source_bvh_url, str(source_path))
+        if not download_ok:
+            Log.error("Retargeting aborted: unable to fetch generated BVH from storage")
+            return False
+
+        submit_kwargs: Dict[str, Any] = {"src_file": str(source_path), "tgt_file": str(target_fbx_path)}
+
+        if RETARGET_SOURCE_REST_FILE:
+            submit_kwargs["src_rest_file"] = RETARGET_SOURCE_REST_FILE
+        if RETARGET_TARGET_REST_FILE:
+            submit_kwargs["tgt_rest_file"] = RETARGET_TARGET_REST_FILE
+        if preset:
+            submit_kwargs["preset_name"] = preset
+
+        response = await submit_task(RETARGET_SERVICE_URL, **submit_kwargs)
+        task_id = response.get("task_id") if isinstance(response, dict) else None
+        if not task_id:
+            Log.error(f"Retarget service did not return task_id, response={response}")
+            return False
+
+        Log.info(f"Retarget task submitted: {task_id}")
+
+        while True:
+            status = await check_task_status(RETARGET_STATUS_URL, task_id)
+            if not isinstance(status, dict):
+                Log.error(f"Unexpected retarget status payload: {status}")
+                return False
+
+            if "error" in status:
+                Log.error(f"Retarget status query failed: {status}")
+                return False
+
+            state = status.get("status")
+            if state == "completed":
+                download_url = status.get("download_url") or status.get("result_url")
+                if not download_url:
+                    Log.error(f"Retarget task completed without download URL: {status}")
+                    return False
+
+                if download_url.startswith("http"):
+                    final_url = download_url
+                else:
+                    final_url = f"{BLENDER_BASE_URL.rstrip('/')}/{download_url.lstrip('/')}"
+
+                output_path = Path(output_fbx_path)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+
+                saved = await download_file(final_url, str(output_path))
+                if not saved:
+                    Log.error("Failed to download FBX result from retarget service")
+                    return False
+
+                Log.info(f"Retarget task {task_id} completed and saved to {output_path}")
+                return True
+
+            if state == "failed":
+                err_msg = status.get("error_message") or status.get("message")
+                Log.error(f"Retarget task {task_id} failed: {err_msg}")
+                return False
+
+            await asyncio.sleep(RETARGET_POLL_INTERVAL)
+
+    except Exception as exc:
+        Log.error(f"Retarget service error: {exc}")
+        return False
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+async def render_task_async(anim_path: str, mesh_path: str, output_video_path: str) -> bool:
+    """Render task: submit animation to render service and download result."""
+    try:
+        response = await submit_task(RENDER_SERVICE_URL, animation=anim_path, mesh=mesh_path)
+        task_id = response.get("task_id") if isinstance(response, dict) else None
+        if not task_id:
+            Log.error(f"Render service did not return task_id, response={response}")
+            return False
+
+        Log.info(f"Render task submitted: {task_id}")
+
+        while True:
+            status = await check_task_status(RENDER_STATUS_URL, task_id)
+            if not isinstance(status, dict):
+                Log.error(f"Unexpected render status payload: {status}")
+                return False
+
+            if "error" in status:
+                Log.error(f"Render status query failed: {status}")
+                return False
+
+            state = status.get("status")
+            if state == "completed":
+                download_url = status.get("download_url") or status.get("result_url")
+                if not download_url:
+                    Log.error(f"Render task completed without download URL: {status}")
+                    return False
+
+                if download_url.startswith("http"):
+                    final_url = download_url
+                else:
+                    final_url = f"{BLENDER_BASE_URL.rstrip('/')}/{download_url.lstrip('/')}"
+
+                output_path = Path(output_video_path)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+
+                saved = await download_file(final_url, str(output_path))
+                if not saved:
+                    Log.error("Failed to download render result from render service")
+                    return False
+
+                Log.info(f"Render task {task_id} completed and saved to {output_path}")
+                return True
+
+            if state == "failed":
+                err_msg = status.get("error_message") or status.get("message")
+                Log.error(f"Render task {task_id} failed: {err_msg}")
+                return False
+
+            await asyncio.sleep(RETARGET_POLL_INTERVAL)
+
+    except Exception as exc:
+        Log.error(f"Render service error: {exc}")
+        return False
+
+def _get_worker_count(queue_name: str) -> int:
+    """Resolve worker count for a given queue using environment overrides."""
+    env_key = f"MOTION_QUEUE_WORKERS_{queue_name.upper()}"
+    default_workers = NUM_WORKERS if queue_name == "motion_generation" else QUEUE_DEFAULT_WORKERS
+    try:
+        return int(os.environ.get(env_key, default_workers))
+    except (TypeError, ValueError):
+        return default_workers
+
+
+def _ensure_queue(queue_name: str) -> asyncio.Queue:
+    """Ensure the async queue and worker pool for the given queue name exist."""
+    if queue_name not in task_queue_dict:
+        task_queue_dict[queue_name] = asyncio.Queue()
+        pending_queue_map[queue_name] = deque()
+        queue_workers[queue_name] = []
+        Log.info(f"Created task queue: {queue_name}")
+
+    _ensure_workers(queue_name, _get_worker_count(queue_name))
+    return task_queue_dict[queue_name]
+
+
+def _ensure_workers(queue_name: str, target_workers: int) -> None:
+    """Spawn worker coroutines for the queue until target count reached."""
+    workers = queue_workers.setdefault(queue_name, [])
+    if target_workers <= 0:
+        target_workers = 1
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.get_event_loop()
+
+    while len(workers) < target_workers:
+        worker_id = len(workers)
+        worker_task = loop.create_task(_worker_loop(queue_name, worker_id))
+        workers.append(worker_task)
+        Log.info(f"Started worker coroutine queue={queue_name}, worker_id={worker_id}")
+
+
+def _update_queue_metadata(queue_name: str) -> None:
+    """Recompute queue positions for tasks in the specified queue."""
+    task_ids = pending_queue_map.get(queue_name)
+    if task_ids is None:
+        return
+
+    queue_size = len(task_ids)
+    for index, tid in enumerate(list(task_ids)):
+        info = task_status.get(tid)
+        if not info:
+            continue
+        info["queue_name"] = queue_name
+        info["queue_position"] = index
+        info["queue_size"] = queue_size
+
+
+async def _worker_loop(queue_name: str, worker_id: int):
+    """Worker coroutine: process tasks from the specified queue."""
+    queue = task_queue_dict[queue_name]
+    while True:
+        item = await queue.get()
+        task_id: Optional[str] = None
+        try:
+            task_id = item.get("task_id")
+            if not task_id:
+                Log.warning(f"Queue item missing task_id: {item}")
+                continue
+
+            with task_lock:
+                pending = pending_queue_map.get(queue_name)
+                if pending and task_id in pending:
+                    pending.remove(task_id)
+                task_info = task_status.get(task_id)
+                if task_info:
+                    task_info["status"] = "processing"
+                    task_info["message"] = "Task processing started..."
+                    task_info["queue_name"] = queue_name
+                    task_info["queue_position"] = None
+                    task_info["queue_size"] = len(pending) if pending is not None else 0
+                    task_info["last_progress_at"] = datetime.now().isoformat()
+                if pending is not None:
+                    _update_queue_metadata(queue_name)
+
+            if not task_info:
+                Log.warning(f"Task ID {task_id} not found in status table, skipping")
+                continue
+
+            handler: Callable[..., Awaitable] = task_info.get("task") or generate_motion_bvh
+            params = task_info.get("params", {})
+            await handler(task_id=task_id, **params)
+        except Exception as e:
+            Log.error(f"Worker failed to process task queue={queue_name}, task_id={task_id}: {e}")
+            with task_lock:
+                if task_id and task_id in task_status:
+                    info = task_status[task_id]
+                    info["status"] = "failed"
+                    info["message"] = f"Processing failed: {str(e)}"
+                    info["error_message"] = str(e)
+                    info["completed_at"] = datetime.now().isoformat()
+        finally:
+            queue.task_done()
+
+
+async def _monitor_tasks_loop():
+    """Periodic monitoring: update queue positions and detect processing timeouts."""
+    while True:
+        try:
+            now = datetime.now()
+            with task_lock:
+                # Update queue positions
+                for qname, queue_ids in pending_queue_map.items():
+                    qsize = len(queue_ids)
+                    for pos, tid in enumerate(list(queue_ids)):
+                        if tid in task_status:
+                            task_status[tid]["queue_name"] = qname
+                            task_status[tid]["queue_position"] = pos
+                            task_status[tid]["queue_size"] = qsize
+
+                # Detect processing timeouts
+                for tid, info in list(task_status.items()):
+                    if info.get("status") == "processing":
+                        last_str = info.get("last_progress_at") or info.get("created_at")
+                        try:
+                            last = datetime.fromisoformat(last_str) if isinstance(last_str, str) else last_str
+                            if last and (now - last) > timedelta(minutes=TASK_STALE_MIN):
+                                info["status"] = "failed"
+                                info["message"] = "Task processing timeout"
+                                info["error_message"] = "Progress not updated for a long time, marked as timeout"
+                                info["completed_at"] = now.isoformat()
+                        except Exception:
+                            pass
+        except Exception as e:
+            Log.warning(f"Monitor loop exception: {e}")
+        await asyncio.sleep(POLL_INTERVAL_SEC)
+
+
+def _enqueue_task(queue_name: str, task_id: str):
+    """Enqueue task and record queue metadata."""
+    queue = _ensure_queue(queue_name)
+
+    with task_lock:
+        info = task_status[task_id]
+        info["status"] = "queued"
+        info["progress"] = max(info.get("progress", 0.0), 0.05)
+        info["message"] = "Task queued, waiting for processing"
+        info["queued_at"] = datetime.now().isoformat()
+        info["last_progress_at"] = datetime.now().isoformat()
+        info["queue_name"] = queue_name
+        pending_queue_map.setdefault(queue_name, deque()).append(task_id)
+        _update_queue_metadata(queue_name)
+
+    payload = {"queue_name": queue_name, "task_id": task_id}
+    queue.put_nowait(payload)
+    Log.info(f"Task enqueued, queue={queue_name}, task_id={task_id}")
+
 
 def inv_transform(data):
     global mean, std
@@ -188,9 +721,9 @@ def cleanup_old_tasks():
     if tasks_to_remove:
         print(f"Cleaned up {len(tasks_to_remove)} old tasks. Current task count: {len(task_status)}")
 
-def rewrite_prompt_with_llm(user_text: str, user_duration: float) -> Tuple[str, float]:
+async def rewrite_prompt_with_llm(user_text: str, user_duration: float) -> Tuple[str, float]:
     """
-    Rewrite user prompt using LLM.
+    Rewrite user prompt using LLM asynchronously.
 
     Args:
         user_text: Original user input text
@@ -214,43 +747,50 @@ def rewrite_prompt_with_llm(user_text: str, user_duration: float) -> Tuple[str, 
     model_name = os.getenv("OPENAI_MODEL", "DeepSeek-R1-0528")
 
     try:
-        # Call LLM API with streaming
-        response = openai_client.chat.completions.create(
-            model=model_name,
-            stream=True,
-            extra_body={
-                "provider": {
-                    "only": [],
-                    "order": [],
-                    "sort": None,
-                    "input_price_range": [],
-                    "output_price_range": [],
-                    "throughput_range": [],
-                    "latency_range": [0, 3]
-                }
-            },
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_text}
-            ]
-        )
+        # Run blocking OpenAI API call in thread pool to avoid blocking event loop
+        loop = asyncio.get_event_loop()
+        
+        def _call_llm():
+            response = openai_client.chat.completions.create(
+                model=model_name,
+                stream=True,
+                extra_body={
+                    "provider": {
+                        "only": [],
+                        "order": [],
+                        "sort": None,
+                        "input_price_range": [],
+                        "output_price_range": [],
+                        "throughput_range": [],
+                        "latency_range": [0, 3]
+                    }
+                },
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_text}
+                ]
+            )
 
-        # Collect streaming response
-        full_content = ""
-        reasoning_content = ""
+            # Collect streaming response
+            full_content = ""
+            reasoning_content = ""
 
-        for chunk in response:
-            if not getattr(chunk, "choices", None):
-                continue
+            for chunk in response:
+                if not getattr(chunk, "choices", None):
+                    continue
 
-            reasoning = getattr(chunk.choices[0].delta, "reasoning_content", None)
-            if reasoning:
-                reasoning_content += reasoning
+                reasoning = getattr(chunk.choices[0].delta, "reasoning_content", None)
+                if reasoning:
+                    reasoning_content += reasoning
 
-            content = getattr(chunk.choices[0].delta, "content", None)
-            if content:
-                full_content += content
+                content = getattr(chunk.choices[0].delta, "content", None)
+                if content:
+                    full_content += content
 
+            return full_content
+
+        full_content = await loop.run_in_executor(None, _call_llm)
+        
         print(f"LLM Response: {full_content}")
 
         # Parse the response
@@ -550,16 +1090,27 @@ async def lifespan(app: FastAPI):
 
     print("Models loaded successfully!")
     
+    # Initialize motion generation queue
+    _ensure_queue("motion_generation")
+    
     # Start periodic cleanup task
     cleanup_task = asyncio.create_task(periodic_cleanup())
+    
+    # Start task monitoring loop
+    monitor_task = asyncio.create_task(_monitor_tasks_loop())
     
     yield
     
     # Shutdown
     print("Shutting down...")
     cleanup_task.cancel()
+    monitor_task.cancel()
     try:
         await cleanup_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await monitor_task
     except asyncio.CancelledError:
         pass
 
@@ -568,17 +1119,25 @@ app = FastAPI(title="Motion Generation Service", lifespan=lifespan)
 async def generate_motion_bvh(task_id: str, text: str, duration: float):
     """Background task to generate motion and upload to MinIO"""
     global models, cfg, skeleton, mean, std, retargeter, minio_client, task_status
-    
+    await asyncio.sleep(0.01)  # Yield control to event loop
     try:
         # Update status to processing
         task_status[task_id]["status"] = "processing"
         task_status[task_id]["progress"] = 0.1
+        task_status[task_id]["message"] = "Starting prompt rewriting..."
+
+        rewritten_text, final_duration = await rewrite_prompt_with_llm(text, duration)
+        print(f"Rewritten text: {rewritten_text}, final duration: {final_duration}")
+
+        # Update status to processing
+        task_status[task_id]["status"] = "processing"
+        task_status[task_id]["progress"] = 0.3
         task_status[task_id]["message"] = "Starting motion generation..."
         
         device = torch.device(cfg.device)
         
         # Convert duration to frames (30 FPS)
-        frames = int(duration * 30)
+        frames = int(final_duration * 30)
         # Ensure frames is within valid range and divisible by 4
         frames = max(7*30, min(frames, 10*30))  # 7-10 seconds range
         frames = (frames // 4) * 4  # Make divisible by 4
@@ -589,7 +1148,7 @@ async def generate_motion_bvh(task_id: str, text: str, duration: float):
         task_status[task_id]["message"] = "Generating motion tokens..."
         
         # Generate motion
-        mids = models['t2m_transformer'].generate([text], m_length//4, cfg.time_steps[0], cfg.cond_scales[0], temperature=1)
+        mids = models['t2m_transformer'].generate([rewritten_text], m_length//4, cfg.time_steps[0], cfg.cond_scales[0], temperature=1)
         
         task_status[task_id]["progress"] = 0.5
         task_status[task_id]["message"] = "Decoding motion..."
@@ -637,7 +1196,7 @@ async def generate_motion_bvh(task_id: str, text: str, duration: float):
         )
         
         # Generate BVH content
-        retargeted_anim = retargeter.rest_pose_retarget(new_anim, tgt_rest='A')
+        retargeted_anim = retargeter.rest_pose_retarget(new_anim, tgt_rest='T')
         
         # Save BVH to memory buffer
         bvh_buffer = io.StringIO()
@@ -659,14 +1218,81 @@ async def generate_motion_bvh(task_id: str, text: str, duration: float):
         )
         
         # Generate presigned URL (valid for 24 hours)
-        download_url = minio_client.presigned_get_object(bucket_name, object_name, expires=timedelta(hours=24))
+        download_generated_url = minio_client.presigned_get_object(bucket_name, object_name, expires=timedelta(hours=24))
         
         # Update task status
-        task_status[task_id]["status"] = "completed"
-        task_status[task_id]["progress"] = 1.0
+        task_status[task_id]["status"] = "retargeting"
+        task_status[task_id]["progress"] = 0.8
         task_status[task_id]["message"] = "Motion generation completed successfully"
         task_status[task_id]["completed_at"] = datetime.now().isoformat()
-        task_status[task_id]["download_url"] = download_url
+        task_status[task_id]["download_url"] = download_generated_url
+
+        temp_dir = f"/tmp/snap_{task_id}"
+        os.makedirs(temp_dir, exist_ok=True)
+
+        # retarget to Momax
+        fbx_path = f"{temp_dir}/motion_{task_id}.fbx"
+        retarget_success = await retarget_task_async(download_generated_url, RETARGET_TARGET_FILE, output_fbx_path=fbx_path, preset_name=RETARGET_PRESET_NAME)
+
+        # upload retargeted fbx if successful
+        if retarget_success:
+            # Upload FBX to MinIO
+            fbx_object_name = f"motion_{task_id}.fbx"
+            with open(f"motion_{task_id}.fbx", "rb") as fbx_file:
+                fbx_data = fbx_file.read()
+                minio_client.put_object(
+                    bucket_name=bucket_name,
+                    object_name=fbx_object_name,
+                    data=io.BytesIO(fbx_data),
+                    length=len(fbx_data),
+                    content_type="application/octet-stream"
+                )
+            
+            # Generate presigned URL for FBX (valid for 24 hours)
+            download_fbx_url = minio_client.presigned_get_object(bucket_name, fbx_object_name, expires=timedelta(hours=24))
+            
+            # Update task status with FBX download URL
+            task_status[task_id]["status"] = "rendering"
+            task_status[task_id]["progress"] = 0.9
+            task_status[task_id]["message"] = "Motion is rendering"
+            task_status[task_id]["completed_at"] = datetime.now().isoformat()
+            task_status[task_id]["result_url"] = {"retargeted": download_fbx_url}
+            task_status[task_id]["download_url"] = download_fbx_url
+            
+            task_status[task_id]["message"] = "Motion generation and retargeting completed successfully"
+        else:
+            task_status[task_id]["status"] = "failed"
+            Log.warning("Retargeting to SMPL-X failed; BVH output remains available")
+            raise Exception("Retargeting to SMPL-X failed")
+
+        video_path = f"{temp_dir}/motion_{task_id}.mp4"
+        render_success = await render_task_async(fbx_path, RETARGET_TARGET_FILE, output_video_path=video_path)
+        if render_success:
+            # Upload video to MinIO
+            video_object_name = f"motion_{task_id}.mp4"
+            with open(video_path, "rb") as video_file:
+                video_data = video_file.read()
+                minio_client.put_object(
+                    bucket_name=bucket_name,
+                    object_name=video_object_name,
+                    data=io.BytesIO(video_data),
+                    length=len(video_data),
+                    content_type="video/mp4"
+                )
+            
+            # Generate presigned URL for video (valid for 24 hours)
+            download_video_url = minio_client.presigned_get_object(bucket_name, video_object_name, expires=timedelta(hours=24))
+            
+            # Update task status with video download URL
+            task_status[task_id]["status"] = "completed"
+            task_status[task_id]["progress"] = 1.0
+            task_status[task_id]["message"] = "Motion generation, retargeting, and rendering completed successfully"
+            task_status[task_id]["completed_at"] = datetime.now().isoformat()
+            task_status[task_id]["result_url"]["video"] = download_video_url
+        else:
+            task_status[task_id]["status"] = "failed"
+            Log.warning("Rendering video failed; BVH and FBX outputs remain available")
+            raise Exception("Rendering video failed")
         
         # Clean up old tasks to prevent memory leaks
         cleanup_old_tasks()
@@ -679,6 +1305,7 @@ async def generate_motion_bvh(task_id: str, text: str, duration: float):
         
         # Clean up old tasks even on failure
         cleanup_old_tasks()
+        raise e
 
 @app.post("/upload", response_model=UploadResponse)
 async def upload_motion_request(request: MotionRequest, background_tasks: BackgroundTasks):
@@ -693,31 +1320,38 @@ async def upload_motion_request(request: MotionRequest, background_tasks: Backgr
 
     # Rewrite prompt with LLM
     print(f"Original text: {request.text}, duration: {request.duration}")
-    rewritten_text, final_duration = rewrite_prompt_with_llm(request.text, request.duration)
-    print(f"Rewritten text: {rewritten_text}, final duration: {final_duration}")
 
     # Generate unique task ID
     task_id = str(uuid.uuid4())
 
     # Initialize task status
-    task_status[task_id] = {
-        "task_id": task_id,
-        "status": "pending",
-        "progress": 0.0,
-        "message": "Task queued for processing",
-        "created_at": datetime.now().isoformat(),
-        "text": rewritten_text,
-        "original_text": request.text,
-        "duration": final_duration
-    }
+    with task_lock:
+        task_status[task_id] = {
+            "task_id": task_id,
+            "task": generate_motion_bvh,
+            "params": {"text": request.text, "duration": request.duration},
+            "status": "pending",
+            "progress": 0.0,
+            "message": "Task created",
+            "created_at": datetime.now().isoformat(),
+            "text": request.text,
+            "original_text": request.text,
+            "duration": request.duration
+        }
 
-    # Start background task with rewritten text and final duration
-    background_tasks.add_task(generate_motion_bvh, task_id, rewritten_text, final_duration)
+    # Enqueue task instead of using background_tasks
+    _enqueue_task(queue_name="motion_generation", task_id=task_id)
+
+    # Return task status with queue info
+    with task_lock:
+        queue_name = task_status[task_id].get("queue_name", "motion_generation")
+        queue_snapshot = list(pending_queue_map.get(queue_name, deque()))
+        pos = queue_snapshot.index(task_id) if task_id in queue_snapshot else None
 
     return UploadResponse(
         task_id=task_id,
-        status="pending",
-        message="Motion generation task submitted successfully"
+        status="queued",
+        message=f"Motion generation task submitted and queued (position: {pos}, queue size: {len(queue_snapshot)})"
     )
 
 @app.get("/status/{task_id}", response_model=TaskStatusResponse)
@@ -751,6 +1385,61 @@ async def get_download_url(task_id: str):
 async def health_check():
     """Health check endpoint"""
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+
+@app.get("/queue")
+async def get_queue_state():
+    """Get current queue state"""
+    with task_lock:
+        queues = {
+            name: {
+                "queue_size": len(ids),
+                "task_ids": list(ids),
+            }
+            for name, ids in pending_queue_map.items()
+        }
+        total_size = sum(len(ids) for ids in pending_queue_map.values())
+        return {
+            "total_queue_size": total_size,
+            "queues": queues,
+        }
+
+@app.get("/tasks")
+async def list_tasks():
+    """List all tasks with their status"""
+    with task_lock:
+        tasks = []
+        for task_id, task_info in task_status.items():
+            # Calculate task age
+            created_at_str = task_info.get("created_at", "")
+            try:
+                created_at = datetime.fromisoformat(created_at_str) if created_at_str else datetime.now()
+                age = datetime.now() - created_at
+                age_minutes = age.total_seconds() / 60
+            except:
+                age_minutes = 0
+            
+            item = {
+                "task_id": task_id,
+                "status": task_info.get("status"),
+                "progress": task_info.get("progress"),
+                "message": task_info.get("message"),
+                "age_minutes": round(age_minutes, 1),
+                "created_at": created_at_str,
+            }
+            
+            # Add queue info if available
+            if "queue_position" in task_info:
+                item["queue_position"] = task_info.get("queue_position")
+                item["queue_size"] = task_info.get("queue_size")
+            if task_info.get("queue_name"):
+                item["queue_name"] = task_info.get("queue_name")
+            
+            tasks.append(item)
+        
+        return {
+            "total_tasks": len(tasks),
+            "tasks": tasks
+        }
 
 if __name__ == "__main__":
     import uvicorn

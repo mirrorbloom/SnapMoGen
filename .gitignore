@@ -115,3 +115,4 @@ cache/
 renamed_bvhs/
 checkpoint_dir/
 *__pycache__/
+assets/
