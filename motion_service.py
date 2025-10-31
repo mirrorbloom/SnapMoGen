@@ -1238,7 +1238,7 @@ async def generate_motion_bvh(task_id: str, text: str, duration: float):
         if retarget_success:
             # Upload FBX to MinIO
             fbx_object_name = f"motion_{task_id}.fbx"
-            with open(f"motion_{task_id}.fbx", "rb") as fbx_file:
+            with open(fbx_path, "rb") as fbx_file:
                 fbx_data = fbx_file.read()
                 minio_client.put_object(
                     bucket_name=bucket_name,
