@@ -1256,7 +1256,7 @@ async def generate_motion_bvh(task_id: str, text: str, duration: float):
             task_status[task_id]["progress"] = 0.9
             task_status[task_id]["message"] = "Motion is rendering"
             task_status[task_id]["completed_at"] = datetime.now().isoformat()
-            task_status[task_id]["result_url"] = {"retargeted": download_fbx_url}
+            task_status[task_id]["result_urls"] = {"retargeted": download_fbx_url}
             task_status[task_id]["download_url"] = download_fbx_url
             
             task_status[task_id]["message"] = "Motion generation and retargeting completed successfully"
@@ -1288,7 +1288,7 @@ async def generate_motion_bvh(task_id: str, text: str, duration: float):
             task_status[task_id]["progress"] = 1.0
             task_status[task_id]["message"] = "Motion generation, retargeting, and rendering completed successfully"
             task_status[task_id]["completed_at"] = datetime.now().isoformat()
-            task_status[task_id]["result_url"]["video"] = download_video_url
+            task_status[task_id]["result_urls"]["video"] = download_video_url
         else:
             task_status[task_id]["status"] = "failed"
             Log.warning("Rendering video failed; BVH and FBX outputs remain available")
